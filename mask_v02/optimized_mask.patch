@@ -1,0 +1,205 @@
+--- a/src/predictor.cpp
++++ b/src/predictor.cpp
+@@ -23,6 +23,9 @@
+ 
+  Predictor::Predictor(const std::vector<bool>& vocab) : manager_(),
+     sigmoid_(100001), vocab_(vocab) {
++#if HUTTER_RECORD_DEPTH_BRIER
++  for (double& a : depth_mix_) a = 0.16;
++#endif
+   wordlbl_ = word_label::Create();
+   char_rate::Init(vocab);
+   fxcm_neutral_input_ = sigmoid_.LogitBase(0.5f);
+@@ -1394,16 +1397,160 @@
+ // stage; each learns on its own output.  A bit the coder is already sure of
+ // (P >= kSureE3 / 1000 for one value) keeps its probability, and the end
+ // stage does not learn on it (cell stays -1); the top-1 path stage runs.
++#if HUTTER_RECORD_FAST_VOTE
++// The smoothed log-odds of the causal cache vote were already calculated in
++// SemPredBit(). Linear interpolation avoids a second per-bit FP division.
++// Cache weights are non-negative and the smoothing floor is 0.01, so the
++// log-odds are strictly inside [-log(101), log(101)] = [-4.616, 4.616].
++// Keep the EXACT original 1/256 grid over [-5, 5], 10 KiB rather than 16 KiB.
++// The original indexing arithmetic is deliberately preserved bit-for-bit.
++static double RecordFastVote(double rx) {
++  constexpr int kStart = 768;  // x = -5 in the original table
++  constexpr int kN = 2560;    // up to x = +5 inclusive
++  static float table[kN + 1] = {};
++  static bool initialized = false;
++  if (!initialized) {
++    for (int i = 0; i <= kN; ++i) {
++      const double x = ((double)(i + kStart) / 256.0) - 8.0;
++      table[i] = (float)(1.0 / (1.0 + exp(-x)));
++    }
++    initialized = true;
++  }
++  double pos = (rx + 8.0) * 256.0;
++  if (pos <= (double)kStart) return table[0];
++  if (pos >= (double)(kStart + kN)) return table[kN];
++  const int old_i = (int)pos;
++  const int i = old_i - kStart;
++  return (double)table[i] + (pos - old_i) *
++      ((double)table[i + 1] - (double)table[i]);
++}
++#endif
+ __attribute__((noinline)) uint32_t Predictor::SemCorrect(uint32_t p32) {
+   semantic_cache::State& s = sem_;
+   s.cell = -1;
+   constexpr uint32_t kSure = (uint32_t)((1000 - semantic_cache::kSureE3) * 4294967.296);
+   const bool sure = p32 <= kSure || p32 >= 4294967295u - kSure;
+   const uint32_t pu = (s.nn == 0 || sure) ? p32 : SemUtCorrect(p32);
+-  return TreffCorrect(pu);
++  const uint32_t result = TreffCorrect(pu);
++#if HUTTER_LAB_TRACE
++  {
++    const bool eligible = s.rok && s.uact && s.nn > 0;
++    lab_base_ = result;
++    lab_vote_ = eligible ? (uint32_t)(RecordFastVote(s.rx) * 4294967296.0) : 0u;
++    lab_rc_ = (float)s.rc;
++    lab_depth_ = (unsigned char)(31 - __builtin_clz(manager_.bit_context_ | 1u));
++    lab_nn_ = (unsigned char)(s.nn > 255 ? 255 : s.nn);
++    lab_active_ = eligible;
++    lab_valid_ = true;
++  }
++#endif
++#if HUTTER_RECORD_DEPTH_BAYES || HUTTER_RECORD_DEPTH_BRIER || HUTTER_RECORD_DEPTH_MASK
++  // Causal per-bit-depth gate: the already computed cache log-odds is the
++  // second expert. Only past decoded bits update the optional online gate.
++  if (s.rok && s.uact && s.nn > 0) {
++    const unsigned int k = 31 - __builtin_clz(manager_.bit_context_ | 1u);
++#if HUTTER_RECORD_DEPTH_MASK && !HUTTER_RECORD_DEPTH_BAYES && !HUTTER_RECORD_DEPTH_BRIER
++    // Bit-identical early reject: avoid RecordFastVote and table init unless
++    // the depth qualifies. All prior model corrections are already complete.
++    if (k != 2 && k != 6 && k != 7) return result;
++#endif
++    const double base = (double)result * (1.0 / 4294967296.0);
++    const double vote = RecordFastVote(s.rx);
++    double share = 0.16;
++#if HUTTER_RECORD_DEPTH_BAYES
++    const double candidate = base + 0.16 * (vote - base);
++    share *= depth_mix_[k];
++    record_base_ = base;
++    record_cand_ = candidate;
++    record_depth_ = (unsigned char)k;
++    record_pending_ = true;
++#elif HUTTER_RECORD_DEPTH_BRIER
++    share = depth_mix_[k];
++    record_base_ = base;
++    record_vote_ = vote;
++    record_depth_ = (unsigned char)k;
++    record_pending_ = true;
++#else
++    // The depth mask was checked before RecordFastVote.
++#endif
++    const double p = base + share * (vote - base);
++#if HUTTER_RECORD_DEPTH_BRIER
++    record_mix_ = p;
++#endif
++    double q = p * 4294967296.0;
++    if (q < 1.0) q = 1.0;
++    if (q > 4294967295.0) q = 4294967295.0;
++    return (uint32_t)(q + 0.5);
++  }
++#if HUTTER_RECORD_DEPTH_BAYES || HUTTER_RECORD_DEPTH_BRIER
++  record_pending_ = false;
++#endif
++  return result;
++#else
++#if HUTTER_RECORD_FINAL_GATE
++  // Independent final residual after the existing SEMCACHE logistic stage
++  // and top-1 path stage.  Only the prefix-compatible neighbours vote here:
++  // their weights are calculated from previously decoded stream bytes.
++  // This exact formula was evaluated on two disjoint short research samples.
++  if (s.rok && s.uact && s.nn > 0) {
++    constexpr double kShare = 0.16;
++#if HUTTER_RECORD_FAST_VOTE
++    // SemPredBit set rok only if rm[0][0]+rm[0][1] > 0; wsum is a
++    // positive sum of exp weights. Therefore d>0 is already guaranteed.
++    const double vote1 = RecordFastVote(s.rx);
++#else
++    const double m0 = s.rm[0][0], m1 = s.rm[0][1];
++    const double d = m0 + m1 + 0.02 * s.wsum;
++    if (!(d > 0.0)) return result;
++      const double vote1 = (m1 + 0.01 * s.wsum) / d;
++#endif
++    double q = (1.0 - kShare) * (double)result +
++               kShare * (vote1 * 4294967296.0);
++    if (q < 1.0) q = 1.0;
++    if (q > 4294967295.0) q = 4294967295.0;
++    return (uint32_t)(q + 0.5);
++  }
++#endif
++  return result;
++#endif
+ }
+ 
+ __attribute__((noinline)) void Predictor::SemLearn(int bit) {
++#if HUTTER_RECORD_DEPTH_BAYES || HUTTER_RECORD_DEPTH_BRIER
++  if (record_pending_) {
++    double& a = depth_mix_[record_depth_];
++#if HUTTER_RECORD_DEPTH_BAYES
++    const double p0 = bit ? record_base_ : 1.0 - record_base_;
++    const double p1 = bit ? record_cand_ : 1.0 - record_cand_;
++    a = ((a * p1) / (a * p1 + (1.0 - a) * p0)) * 0.9998 + 0.0001;
++#else
++    a += 0.01 * ((double)bit - record_mix_) *
++         (record_vote_ - record_base_);
++    if (a < 0.0) a = 0.0;
++    if (a > 0.32) a = 0.32;
++#endif
++    record_pending_ = false;
++  }
++#endif
++#if HUTTER_LAB_TRACE
++  if (lab_valid_) {
++    static FILE* trace = []() -> FILE* {
++      const char* p = getenv("HUTTER_LAB_TRACE_PATH");
++      return p && *p ? fopen(p, "wb") : nullptr;
++    }();
++    if (trace) {
++      struct TraceRow {
++        uint32_t base, vote;
++        float rc;
++        unsigned char depth, bit, active, nn;
++      } r = {lab_base_, lab_vote_, lab_rc_, lab_depth_,
++             (unsigned char)(bit & 1), lab_active_, lab_nn_};
++      static_assert(sizeof(TraceRow) == 16, "fixed record size");
++      fwrite(&r, sizeof(r), 1, trace);
++    }
++    lab_valid_ = false;
++  }
++#endif
+   SemUtLearn(bit);
+   TreffLearn(bit);
+ }
+--- a/src/predictor.h
++++ b/src/predictor.h
+@@ -96,6 +96,17 @@
+   uint32_t TreffCorrect(uint32_t p32);
+   void TreffLearn(int bit);
+   semantic_cache::State sem_;
++  // Always present in the GCC lab to keep the EXACT SAME class layout when
++  // switching compile-time algorithms in just predictor.o.
++  double depth_mix_[8] = {0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5};
++  double record_base_ = 0.5, record_cand_ = 0.5;
++  double record_vote_ = 0.5, record_mix_ = 0.5;
++  unsigned char record_depth_ = 0;
++  bool record_pending_ = false;
++  uint32_t lab_base_ = 0, lab_vote_ = 0;
++  float lab_rc_ = 0;
++  unsigned char lab_depth_ = 0, lab_active_ = 0, lab_nn_ = 0;
++  bool lab_valid_ = false;
+   cache_hit::State treff_;
+   adaptive_depth::State adepth_;
+   unsigned long long GetNumModels();
+--- a/makefile
++++ b/makefile
+@@ -69,6 +69,8 @@
+ WORDLBL_SRC := src/word_label.cpp
+ 
+ ROOT_DIR := $(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
++# Experimental MASK branch; keep the same frozen gate in encoder and decoder.
++CPPFLAGS_PART-THAT-SHOULD-BE-FAST += -DHUTTER_RECORD_FAST_VOTE=1 -DHUTTER_RECORD_DEPTH_MASK=1
+ LFLAGS += -Wl,-T,$(ROOT_DIR)/encoder_split.lds
+ 
+ prof_gen: CPPFLAGS_PART-THAT-CAN-BE-SLOW    += -fprofile-generate=$(ROOT_DIR)/pgo_data
