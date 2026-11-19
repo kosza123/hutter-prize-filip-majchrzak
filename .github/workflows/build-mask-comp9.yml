@@ -1,0 +1,81 @@
+name: Build optimized MASK comp9 (source only, no 1GB test)
+
+on:
+  push:
+    branches:
+      - experimental/mask-early-v0.2
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-mask:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    steps:
+      - name: Checkout MASK patch
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Download immutable compact-source release and verify SHA-256
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fL --retry 3 --connect-timeout 20 --max-time 300 \
+            'https://github.com/kosza123/hutter-prize-filip-majchrzak/releases/download/v0.1.0-experimental/compact-neif2-source.zip' \
+            -o /tmp/compact-neif2-source.zip
+          echo 'c3686b1a9a53d6ede2ef3e6eeab8a4bf8a7f79280dd493dbfed3307bd0e537aa  /tmp/compact-neif2-source.zip' | sha256sum -c -
+          mkdir -p "$GITHUB_WORKSPACE/compact-src"
+          unzip -q /tmp/compact-neif2-source.zip -d "$GITHUB_WORKSPACE/compact-src"
+          SRC_BUILD=$(find "$GITHUB_WORKSPACE/compact-src" -type f -name build.sh -print -quit)
+          test -n "$SRC_BUILD" || { echo 'ERROR: source ZIP has no build.sh'; exit 1; }
+          SRC_DIR=$(dirname "$SRC_BUILD")
+          echo "SRC_DIR=$SRC_DIR" >> "$GITHUB_ENV"
+          test -f "$SRC_DIR/src/predictor.cpp"
+          test -f "$SRC_DIR/src/predictor.h"
+          test -f "$SRC_DIR/makefile"
+          test -f "$SRC_DIR/weights-poc8m_w2048_tf2t3_pruned_v5k_np2.c5"
+          echo '729694cba4969b7d833686ed3f597ff04d3b226da849d5f8004ec020a0ed9563  '"$SRC_DIR"'/weights-poc8m_w2048_tf2t3_pruned_v5k_np2.c5' | sha256sum -c -
+      - name: Apply MASK patch on top of compact-footer base
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$SRC_DIR"
+          git apply --check "$GITHUB_WORKSPACE/mask_v02/optimized_mask.patch"
+          git apply "$GITHUB_WORKSPACE/mask_v02/optimized_mask.patch"
+          grep -q 'HUTTER_RECORD_DEPTH_MASK=1' makefile
+          grep -q 'if (k != 2 && k != 6 && k != 7) return result;' src/predictor.cpp
+          sha256sum src/predictor.cpp src/predictor.h makefile > "$GITHUB_WORKSPACE/mask-build-source-sha256.txt"
+      - name: Install fixed compiler/toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo bash "$SRC_DIR/install.sh" > "$GITHUB_WORKSPACE/mask-install.log" 2>&1 || { tail -100 "$GITHUB_WORKSPACE/mask-install.log"; exit 1; }
+          clang++-18 --version | head -2
+      - name: Build official-format MASK comp9 without running 1 GB compression
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/mask-out"
+          cd "$GITHUB_WORKSPACE/mask-out"
+          bash "$SRC_DIR/build.sh" > "$GITHUB_WORKSPACE/mask-build.log" 2>&1 || { tail -120 "$GITHUB_WORKSPACE/mask-build.log"; exit 1; }
+          test -s comp9
+          sha256sum comp9 > "$GITHUB_WORKSPACE/mask-comp9-sha256.txt"
+          wc -c comp9 > "$GITHUB_WORKSPACE/mask-comp9-size.txt"
+          file comp9
+          echo 'NOTE: no matching enwik9 archive9 was generated; NOT a contest record'
+      - name: Save build evidence and candidate (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hutter-mask-v02-compiled-comp9-unverified
+          path: |
+            mask-out/comp9
+            mask-comp9-sha256.txt
+            mask-comp9-size.txt
+            mask-build-source-sha256.txt
+            mask-install.log
+            mask-build.log
+          if-no-files-found: warn
+          retention-days: 30
