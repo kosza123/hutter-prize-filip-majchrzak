@@ -1,0 +1,60 @@
+name: Publish SAPIO MASK v0.2 compiled lab bundle (no recompression)
+
+on:
+  push:
+    branches:
+      - share/sapio-mask-v02-lab
+    paths:
+      - .github/workflows/publish-sapio-mask-v02.yml
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  release-bundle:
+    if: github.repository == 'kosza123/hutter-prize-filip-majchrzak'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout public release docs
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Retrieve previously built artifact (do not rebuild)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh run download 44617030588 --repo "$GITHUB_REPOSITORY" \
+            --name hutter-mask-v02-compiled-comp9-unverified --dir downloaded
+          BINARY=$(find downloaded -type f -name comp9 -print -quit)
+          test -n "$BINARY" && test -s "$BINARY"
+          echo '88c7fd65064a725567fd36d3fdfc28bb0c5a9d7c4d985ce2972f9a8c13300995  '"$BINARY" | sha256sum -c -
+          test "$(wc -c < "$BINARY")" -eq 4042713
+          mkdir -p dist
+          cp "$BINARY" dist/comp9
+          cp PUBLIC_TEST_INSTRUCTIONS.md HUTTER_PRIZE_RULES_LINKS.md LICENSE dist/
+          echo '88c7fd65064a725567fd36d3fdfc28bb0c5a9d7c4d985ce2972f9a8c13300995  comp9' > dist/SHA256_COMP9.txt
+          cd dist
+          zip -X -9 -q ../SAPIO_MASK_v0.2_LAB_UNVERIFIED.zip comp9 SHA256_COMP9.txt PUBLIC_TEST_INSTRUCTIONS.md HUTTER_PRIZE_RULES_LINKS.md LICENSE
+          test -s ../SAPIO_MASK_v0.2_LAB_UNVERIFIED.zip
+          cd ..
+          sha256sum SAPIO_MASK_v0.2_LAB_UNVERIFIED.zip
+
+      - name: Publish publicly downloadable prerelease
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create sapio-mask-v0.2-lab-20261119 \
+            SAPIO_MASK_v0.2_LAB_UNVERIFIED.zip \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title 'SAPIO MASK v0.2 — lab candidate (not a verified Hutter Prize record)' \
+            --prerelease \
+            --notes 'Public download of the original 2026-11-19 GitHub Actions compiled comp9 (SHA-256 88c7fd65064a725567fd36d3fdfc28bb0c5a9d7c4d985ce2972f9a8c13300995), plus test instructions, rules links and GPL-3.0 license. NO full enwik9 compression/decompression completed; NOT a verified contest result. Do not combine with older v0.1 archive9. Original test/build run: https://github.com/kosza123/hutter-prize-filip-majchrzak/actions/runs/44617030588'
